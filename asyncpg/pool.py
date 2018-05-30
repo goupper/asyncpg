@@ -92,7 +92,7 @@ class PoolConnectionProxy(connection._ConnectionProxy,
 
 class PoolConnectionHolder:
 
-    __slots__ = ('_con', '_pool', '_loop',
+    __slots__ = ('_con', '_pool', '_loop', '_proxy',
                  '_connect_args', '_connect_kwargs',
                  '_max_queries', '_setup', '_init',
                  '_max_inactive_time', '_in_use',
@@ -103,6 +103,7 @@ class PoolConnectionHolder:
 
         self._pool = pool
         self._con = None
+        self._proxy = None
 
         self._connect_args = connect_args
         self._connect_kwargs = connect_kwargs
@@ -111,7 +112,7 @@ class PoolConnectionHolder:
         self._setup = setup
         self._init = init
         self._inactive_callback = None
-        self._in_use = False
+        self._in_use = None  # type: asyncio.Future
         self._timeout = None
 
     async def connect(self):
@@ -152,7 +153,7 @@ class PoolConnectionHolder:
 
         self._maybe_cancel_inactive_callback()
 
-        proxy = PoolConnectionProxy(self, self._con)
+        self._proxy = proxy = PoolConnectionProxy(self, self._con)
 
         if self._setup is not None:
             try:
@@ -163,31 +164,29 @@ class PoolConnectionHolder:
                 # we close it.  A new connection will be created
                 # when `acquire` is called again.
                 try:
-                    proxy._detach()
                     # Use `close` to close the connection gracefully.
                     # An exception in `setup` isn't necessarily caused
                     # by an IO or a protocol error.
                     await self._con.close()
                 finally:
-                    self._con = None
                     raise ex
 
-        self._in_use = True
+        self._in_use = self._pool._loop.create_future()
+
         return proxy
 
     async def release(self, timeout):
-        assert self._in_use
-        self._in_use = False
-        self._timeout = None
+        assert self._in_use is not None
 
         if self._con.is_closed():
-            self._con = None
+            # When closing, pool connections perform the necessary
+            # cleanup, so we don't have to do anything else here.
+            return
 
-        elif self._con._protocol.queries_count >= self._max_queries:
-            try:
-                await self._con.close(timeout=timeout)
-            finally:
-                self._con = None
+        self._timeout = None
+
+        if self._con._protocol.queries_count >= self._max_queries:
+            await self._con.close(timeout=timeout)
 
         else:
             try:
@@ -213,39 +212,32 @@ class PoolConnectionHolder:
                     # an IO error, so terminate the connection.
                     self._con.terminate()
                 finally:
-                    self._con = None
                     raise ex
+
+        self._release()
 
         assert self._inactive_callback is None
         if self._max_inactive_time and self._con is not None:
             self._inactive_callback = self._pool._loop.call_later(
                 self._max_inactive_time, self._deactivate_connection)
 
-    async def close(self):
-        self._maybe_cancel_inactive_callback()
-        if self._con is None:
+    async def wait_until_released(self):
+        if self._in_use is None:
             return
-        if self._con.is_closed():
-            self._con = None
-            return
+        else:
+            await self._in_use
 
-        try:
+    async def close(self):
+        if self._con is not None:
+            # Connection.close() will call _release_on_close() to
+            # finish holder cleanup.
             await self._con.close()
-        finally:
-            self._con = None
 
     def terminate(self):
-        self._maybe_cancel_inactive_callback()
-        if self._con is None:
-            return
-        if self._con.is_closed():
-            self._con = None
-            return
-
-        try:
+        if self._con is not None:
+            # Connection.terminate() will call _release_on_close() to
+            # finish holder cleanup.
             self._con.terminate()
-        finally:
-            self._con = None
 
     def _maybe_cancel_inactive_callback(self):
         if self._inactive_callback is not None:
@@ -253,11 +245,37 @@ class PoolConnectionHolder:
             self._inactive_callback = None
 
     def _deactivate_connection(self):
-        assert not self._in_use
-        if self._con is None or self._con.is_closed():
-            return
-        self._con.terminate()
+        assert self._in_use is None
+        if self._con is not None:
+            self._con.terminate()
+            # Must call clear_connection, because _deactivate_connection
+            # is called when the connection is *not* checked out, and
+            # so terminate() above will not call the below.
+            self._release_on_close()
+
+    def _release_on_close(self):
+        self._maybe_cancel_inactive_callback()
+        self._release()
         self._con = None
+
+    def _release(self):
+        """Release this connection holder."""
+        if self._in_use is None:
+            # The holder is not checked out.
+            return
+
+        if not self._in_use.done():
+            self._in_use.set_result(None)
+        self._in_use = None
+
+        # Let go of the connection proxy.
+        if self._proxy is not None:
+            if self._proxy._con is not None:
+                self._proxy._detach()
+            self._proxy = None
+
+        # Put ourselves back to the pool queue.
+        self._pool._queue.put_nowait(self)
 
 
 class Pool:
@@ -273,7 +291,7 @@ class Pool:
 
     __slots__ = ('_queue', '_loop', '_minsize', '_maxsize',
                  '_working_addr', '_working_config', '_working_params',
-                 '_holders', '_initialized', '_closed',
+                 '_holders', '_initialized', '_closing', '_closed',
                  '_connection_class')
 
     def __init__(self, *connect_args,
@@ -322,6 +340,7 @@ class Pool:
 
         self._connection_class = connection_class
 
+        self._closing = False
         self._closed = False
 
         for _ in range(max_size):
@@ -468,7 +487,10 @@ class Pool:
                 ch._timeout = timeout
                 return proxy
 
+        if self._closing:
+            raise exceptions.InterfaceError('pool is closing')
         self._check_init()
+
         if timeout is None:
             return await _acquire_impl()
         else:
@@ -488,14 +510,6 @@ class Pool:
         .. versionchanged:: 0.14.0
             Added the *timeout* parameter.
         """
-        async def _release_impl(ch: PoolConnectionHolder, timeout: float):
-            try:
-                await ch.release(timeout)
-            finally:
-                self._queue.put_nowait(ch)
-
-        self._check_init()
-
         if (type(connection) is not PoolConnectionProxy or
                 connection._holder._pool is not self):
             raise exceptions.InterfaceError(
@@ -507,35 +521,64 @@ class Pool:
             # Already released, do nothing.
             return
 
-        con = connection._detach()
+        self._check_init()
+
+        con = connection._con
         con._on_release()
+        ch = connection._holder
 
         if timeout is None:
-            timeout = connection._holder._timeout
+            timeout = ch._timeout
 
         # Use asyncio.shield() to guarantee that task cancellation
         # does not prevent the connection from being returned to the
         # pool properly.
-        return await asyncio.shield(
-            _release_impl(connection._holder, timeout), loop=self._loop)
+        return await asyncio.shield(ch.release(timeout), loop=self._loop)
 
     async def close(self):
-        """Gracefully close all connections in the pool."""
+        """Attempt to gracefully close all connections in the pool.
+
+        Wait until all pool connections are released, close them and
+        shut down the pool.  If any error (including cancellation) occurs
+        in ``close()`` the pool will terminate by calling
+        :meth:'Pool.terminate() <pool.Pool.terminate>`.
+
+        .. versionchanged:: 0.16.0
+            ``close()`` now waits until all pool connections are released
+            before closing them and the pool.  Errors raised in ``close()``
+            will cause immediate pool termination.
+        """
         if self._closed:
             return
         self._check_init()
-        self._closed = True
-        coros = [ch.close() for ch in self._holders]
-        await asyncio.gather(*coros, loop=self._loop)
+
+        self._closing = True
+
+        try:
+            release_coros = [
+                ch.wait_until_released() for ch in self._holders]
+            await asyncio.gather(*release_coros, loop=self._loop)
+
+            close_coros = [
+                ch.close() for ch in self._holders]
+            await asyncio.gather(*close_coros, loop=self._loop)
+
+        except Exception:
+            self.terminate()
+            raise
+
+        finally:
+            self._closed = True
+            self._closing = False
 
     def terminate(self):
         """Terminate all connections in the pool."""
         if self._closed:
             return
         self._check_init()
-        self._closed = True
         for ch in self._holders:
             ch.terminate()
+        self._closed = True
 
     def _check_init(self):
         if not self._initialized:
